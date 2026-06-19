@@ -474,15 +474,23 @@ class App(ctk.CTk):
             self.q_vars[q] = v
             ctk.CTkCheckBox(qf, text=q, variable=v, width=50).pack(side="left", padx=4)
 
-        # Row 3: Max results
-        ctk.CTkLabel(config_frame, text="Max results/query:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
-        self.max_results_var = ctk.StringVar(value="100")
-        max_menu = ctk.CTkOptionMenu(config_frame, variable=self.max_results_var,
-                                      values=["100", "500", "1000", "5000", "10000", "20000"],
-                                      width=120)
-        max_menu.grid(row=2, column=1, padx=5, pady=5, sticky="w")
-        ctk.CTkLabel(config_frame, text="100 = 1 API call | 1000 = ~5 calls | 20000 = ~100 calls per query",
-                     text_color="gray", font=("Segoe UI", 10)).grid(row=2, column=2, columnspan=3, padx=10, pady=5, sticky="w")
+        # Row 3: Total papers + per query
+        ctk.CTkLabel(config_frame, text="Total papers max:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        total_frame = ctk.CTkFrame(config_frame, fg_color="transparent")
+        total_frame.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        self.total_papers_var = ctk.StringVar(value="2000")
+        ctk.CTkEntry(total_frame, textvariable=self.total_papers_var, width=70).pack(side="left")
+        ctk.CTkLabel(total_frame, text=" papers total", text_color="gray").pack(side="left", padx=5)
+
+        ctk.CTkLabel(config_frame, text="Per query:").grid(row=2, column=2, padx=10, pady=5, sticky="w")
+        pq_frame = ctk.CTkFrame(config_frame, fg_color="transparent")
+        pq_frame.grid(row=2, column=3, columnspan=2, padx=5, pady=5, sticky="w")
+        self.per_query_var = ctk.StringVar(value="auto")
+        ctk.CTkOptionMenu(pq_frame, variable=self.per_query_var,
+                          values=["auto", "50", "100", "200", "500", "1000", "5000"],
+                          width=100).pack(side="left")
+        ctk.CTkLabel(pq_frame, text="  auto = total / N queries", text_color="gray",
+                     font=("Segoe UI", 10)).pack(side="left", padx=5)
 
         # ---- Tabs ----
         self.tabs = ctk.CTkTabview(self)
@@ -1066,7 +1074,18 @@ class App(ctk.CTk):
         quartiles = self._get_quartiles()
         year_from = int(self.year_from_var.get())
         year_to = int(self.year_to_var.get())
-        max_results = int(self.max_results_var.get())
+
+        total_max = int(self.total_papers_var.get() or 2000)
+        pq = self.per_query_var.get()
+        if pq == "auto":
+            per_query = max(50, total_max // len(queries))
+        else:
+            per_query = int(pq)
+
+        api_calls_est = len(queries) * max(1, per_query // 200)
+        self.search_info.configure(
+            text=f"Plan: {len(queries)} queries x {per_query}/query | "
+                 f"~{api_calls_est} API calls | Max {total_max} total")
 
         seen = set()
         self.corpus = []
@@ -1075,15 +1094,22 @@ class App(ctk.CTk):
         for i, query in enumerate(queries):
             if self.engine.stop_flag:
                 break
+            remaining = total_max - len(self.corpus)
+            if remaining <= 0:
+                self.status_var.set(f"Reached {total_max} papers limit")
+                break
+
+            this_query_max = min(per_query, remaining)
 
             def on_progress(n, qi=i, q=query):
-                self.status_var.set(f"[{qi+1}/{len(queries)}] {q[:40]}... ({n} found)")
+                self.status_var.set(
+                    f"[{qi+1}/{len(queries)}] {q[:35]}... ({n} this query | {len(self.corpus)+n} total)")
 
             self.status_var.set(f"[{i+1}/{len(queries)}] {query[:50]}...")
             self.progress.set(i / len(queries))
 
             results = self.engine.search(query, seen, quartiles, email,
-                                         max_results, year_from, year_to, on_progress)
+                                         this_query_max, year_from, year_to, on_progress)
             if results is None:
                 self.status_var.set("Daily budget exhausted — retry after midnight UTC")
                 messagebox.showwarning("Budget", "API budget exhausted.\nResets at midnight UTC (~7PM Colombia).")
