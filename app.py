@@ -1,6 +1,6 @@
 """
-ScholarHarvest — Desktop App
-Standalone GUI for searching and downloading scientific papers.
+ScholarHarvest v2 — Desktop App
+Full GUI with detailed PDF diagnostics and pre-filtering.
 """
 
 import csv
@@ -12,10 +12,10 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
 
 import customtkinter as ctk
 import requests
@@ -23,12 +23,12 @@ import requests
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 OPENALEX = "https://api.openalex.org/works"
 
 
 # ============================================================================
-# Engine (same logic, no external deps beyond requests)
+# Engine
 # ============================================================================
 class HarvestEngine:
     def __init__(self):
@@ -82,7 +82,8 @@ class HarvestEngine:
                 "search": "test", "per-page": 1, "mailto": email
             }, timeout=15)
             if r.status_code == 429:
-                return False, r.json().get("message", "Budget exhausted")
+                body = r.json()
+                return False, body.get("message", "Budget exhausted — resets midnight UTC")
             return True, "OK"
         except Exception as e:
             return False, str(e)
@@ -90,7 +91,6 @@ class HarvestEngine:
     def search(self, query, seen, quartiles_ok, email, top_n, year_from, year_to):
         if self.stop_flag:
             return []
-
         filters = [f"from_publication_date:{year_from}-01-01",
                    f"to_publication_date:{year_to}-12-31",
                    "is_paratext:false", "type:article"]
@@ -104,9 +104,7 @@ class HarvestEngine:
                        "authorships,primary_location,open_access,"
                        "best_oa_location,abstract_inverted_index,language,type"),
         }
-
         time.sleep(3 + random.uniform(0, 2))
-
         for attempt in range(6):
             if self.stop_flag:
                 return []
@@ -114,11 +112,9 @@ class HarvestEngine:
                 r = self.session.get(OPENALEX, params=params, timeout=90)
                 if r.status_code == 429:
                     body = r.json() if "json" in r.headers.get("content-type", "") else {}
-                    msg = body.get("message", "")
-                    if "budget" in msg.lower():
+                    if "budget" in body.get("message", "").lower():
                         return None
-                    wait = min(15 * (2 ** attempt), 300) + random.uniform(2, 8)
-                    time.sleep(wait)
+                    time.sleep(min(15 * (2 ** attempt), 300) + random.uniform(2, 8))
                     continue
                 if r.status_code >= 500:
                     time.sleep(10 * (attempt + 1))
@@ -147,6 +143,91 @@ class HarvestEngine:
                 else:
                     return []
         return []
+
+    def verify_pdf_url(self, url):
+        """HEAD request to check if URL actually serves a PDF."""
+        try:
+            r = self.session.head(url, timeout=20, allow_redirects=True)
+            ctype = r.headers.get("Content-Type", "").lower()
+            clength = r.headers.get("Content-Length", "")
+            final_url = r.url
+            size_kb = int(clength) // 1024 if clength.isdigit() else None
+
+            if r.status_code == 403:
+                return {"downloadable": False, "reason": "Forbidden (403) — paywall",
+                        "http": 403, "content_type": ctype, "size_kb": size_kb}
+            if r.status_code == 404:
+                return {"downloadable": False, "reason": "Not found (404)",
+                        "http": 404, "content_type": ctype, "size_kb": size_kb}
+            if r.status_code >= 400:
+                return {"downloadable": False, "reason": f"HTTP {r.status_code}",
+                        "http": r.status_code, "content_type": ctype, "size_kb": size_kb}
+
+            if "pdf" in ctype:
+                return {"downloadable": True, "reason": "PDF confirmed",
+                        "http": r.status_code, "content_type": ctype, "size_kb": size_kb}
+            if "html" in ctype:
+                return {"downloadable": False, "reason": "HTML page (paywall/landing)",
+                        "http": r.status_code, "content_type": ctype, "size_kb": size_kb}
+            if "octet-stream" in ctype and url.lower().endswith(".pdf"):
+                return {"downloadable": True, "reason": "Binary stream (.pdf URL)",
+                        "http": r.status_code, "content_type": ctype, "size_kb": size_kb}
+
+            return {"downloadable": False, "reason": f"Not PDF ({ctype[:40]})",
+                    "http": r.status_code, "content_type": ctype, "size_kb": size_kb}
+        except requests.Timeout:
+            return {"downloadable": False, "reason": "Timeout", "http": 0, "content_type": "", "size_kb": None}
+        except Exception as e:
+            return {"downloadable": False, "reason": f"Error: {str(e)[:40]}",
+                    "http": 0, "content_type": "", "size_kb": None}
+
+    def download_pdf(self, url, dest):
+        if dest.exists() and self._is_valid_pdf(dest):
+            return {"status": "exists", "size_kb": dest.stat().st_size // 1024}
+        for attempt in range(3):
+            if self.stop_flag:
+                return {"status": "stopped", "size_kb": None}
+            try:
+                r = self.session.get(url, timeout=120, stream=True)
+                r.raise_for_status()
+                ctype = r.headers.get("Content-Type", "")
+                if "pdf" not in ctype.lower() and not url.lower().endswith(".pdf"):
+                    return {"status": "not_pdf", "size_kb": None,
+                            "detail": f"Content-Type: {ctype[:50]}"}
+                tmp = dest.with_suffix(".tmp")
+                with open(tmp, "wb") as f:
+                    for chunk in r.iter_content(8192):
+                        f.write(chunk)
+                size = tmp.stat().st_size
+                if size > 1024 and self._is_valid_pdf(tmp):
+                    tmp.replace(dest)
+                    return {"status": "ok", "size_kb": size // 1024}
+                else:
+                    tmp.unlink(missing_ok=True)
+                    return {"status": "invalid", "size_kb": size // 1024,
+                            "detail": "No %PDF- header" if size > 1024 else f"Too small ({size}B)"}
+            except requests.HTTPError as e:
+                return {"status": "http_error", "size_kb": None,
+                        "detail": f"HTTP {e.response.status_code}" if e.response else str(e)}
+            except requests.Timeout:
+                if attempt < 2:
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                return {"status": "timeout", "size_kb": None}
+            except Exception as e:
+                if attempt < 2:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                return {"status": "error", "size_kb": None, "detail": str(e)[:60]}
+        return {"status": "error", "size_kb": None}
+
+    @staticmethod
+    def _is_valid_pdf(path):
+        try:
+            with open(path, "rb") as f:
+                return f.read(5) == b"%PDF-"
+        except Exception:
+            return False
 
     @staticmethod
     def authors_str(work):
@@ -185,38 +266,23 @@ class HarvestEngine:
         except Exception:
             return ""
 
-    def is_valid_pdf(self, path):
-        try:
-            with open(path, "rb") as f:
-                return f.read(5) == b"%PDF-"
-        except Exception:
-            return False
 
-    def download_pdf(self, url, dest):
-        if dest.exists() and self.is_valid_pdf(dest):
-            return "exists"
-        for attempt in range(3):
-            if self.stop_flag:
-                return "stopped"
-            try:
-                r = self.session.get(url, timeout=120, stream=True)
-                r.raise_for_status()
-                ctype = r.headers.get("Content-Type", "")
-                if "pdf" not in ctype.lower() and not url.lower().endswith(".pdf"):
-                    return "not_pdf"
-                tmp = dest.with_suffix(".tmp")
-                with open(tmp, "wb") as f:
-                    for chunk in r.iter_content(8192):
-                        f.write(chunk)
-                if tmp.stat().st_size > 1024 and self.is_valid_pdf(tmp):
-                    tmp.replace(dest)
-                    return "ok"
-                tmp.unlink(missing_ok=True)
-                return "invalid"
-            except Exception:
-                if attempt < 2:
-                    time.sleep(2 * (attempt + 1))
-        return "error"
+# ============================================================================
+# Treeview style helper
+# ============================================================================
+def setup_treeview_style():
+    style = ttk.Style()
+    style.theme_use("clam")
+    style.configure("Custom.Treeview",
+                     background="#2b2b2b", foreground="white",
+                     fieldbackground="#2b2b2b", rowheight=24,
+                     font=("Segoe UI", 10))
+    style.configure("Custom.Treeview.Heading",
+                     background="#1f538d", foreground="white",
+                     font=("Segoe UI", 10, "bold"))
+    style.map("Custom.Treeview",
+              background=[("selected", "#1f538d")],
+              foreground=[("selected", "white")])
 
 
 # ============================================================================
@@ -225,287 +291,419 @@ class HarvestEngine:
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
-
         self.title(f"ScholarHarvest v{__version__}")
-        self.geometry("1000x750")
-        self.minsize(800, 600)
+        self.geometry("1100x800")
+        self.minsize(900, 650)
 
         self.engine = HarvestEngine()
         self.corpus = []
         self.running = False
+        self.pdf_jobs = []
 
+        setup_treeview_style()
         self._build_ui()
 
     def _build_ui(self):
-        # Main container
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(1, weight=1)
 
         # ---- Top: Config ----
         config_frame = ctk.CTkFrame(self)
         config_frame.grid(row=0, column=0, padx=10, pady=(10, 5), sticky="ew")
         config_frame.grid_columnconfigure(1, weight=1)
 
-        # Email
         ctk.CTkLabel(config_frame, text="Email:").grid(row=0, column=0, padx=10, pady=5, sticky="w")
-        self.email_var = ctk.StringVar(value="")
-        ctk.CTkEntry(config_frame, textvariable=self.email_var, placeholder_text="you@university.edu",
-                     width=300).grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.email_var = ctk.StringVar()
+        ctk.CTkEntry(config_frame, textvariable=self.email_var,
+                     placeholder_text="you@university.edu", width=280).grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
-        # Scimago
-        ctk.CTkLabel(config_frame, text="Scimago CSV:").grid(row=0, column=2, padx=10, pady=5, sticky="w")
-        self.scimago_var = ctk.StringVar(value="")
-        ctk.CTkEntry(config_frame, textvariable=self.scimago_var, width=250,
+        ctk.CTkLabel(config_frame, text="Scimago:").grid(row=0, column=2, padx=10, pady=5, sticky="w")
+        self.scimago_var = ctk.StringVar()
+        ctk.CTkEntry(config_frame, textvariable=self.scimago_var, width=220,
                      placeholder_text="(optional)").grid(row=0, column=3, padx=5, pady=5, sticky="w")
-        ctk.CTkButton(config_frame, text="Browse", width=70,
+        ctk.CTkButton(config_frame, text="...", width=35,
                       command=self._browse_scimago).grid(row=0, column=4, padx=5, pady=5)
 
-        # Row 2: Year, Quartiles, Top N
+        # Row 2
         ctk.CTkLabel(config_frame, text="Years:").grid(row=1, column=0, padx=10, pady=5, sticky="w")
-        year_frame = ctk.CTkFrame(config_frame, fg_color="transparent")
-        year_frame.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        yf = ctk.CTkFrame(config_frame, fg_color="transparent")
+        yf.grid(row=1, column=1, padx=5, pady=5, sticky="w")
         self.year_from_var = ctk.StringVar(value="2000")
         self.year_to_var = ctk.StringVar(value="2026")
-        ctk.CTkEntry(year_frame, textvariable=self.year_from_var, width=60).pack(side="left")
-        ctk.CTkLabel(year_frame, text=" to ").pack(side="left")
-        ctk.CTkEntry(year_frame, textvariable=self.year_to_var, width=60).pack(side="left")
+        ctk.CTkEntry(yf, textvariable=self.year_from_var, width=55).pack(side="left")
+        ctk.CTkLabel(yf, text=" — ").pack(side="left")
+        ctk.CTkEntry(yf, textvariable=self.year_to_var, width=55).pack(side="left")
 
         ctk.CTkLabel(config_frame, text="Quartiles:").grid(row=1, column=2, padx=10, pady=5, sticky="w")
-        q_frame = ctk.CTkFrame(config_frame, fg_color="transparent")
-        q_frame.grid(row=1, column=3, columnspan=2, padx=5, pady=5, sticky="w")
-        self.q1_var = ctk.BooleanVar(value=True)
-        self.q2_var = ctk.BooleanVar(value=True)
-        self.q3_var = ctk.BooleanVar(value=False)
-        self.q4_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(q_frame, text="Q1", variable=self.q1_var, width=50).pack(side="left", padx=3)
-        ctk.CTkCheckBox(q_frame, text="Q2", variable=self.q2_var, width=50).pack(side="left", padx=3)
-        ctk.CTkCheckBox(q_frame, text="Q3", variable=self.q3_var, width=50).pack(side="left", padx=3)
-        ctk.CTkCheckBox(q_frame, text="Q4", variable=self.q4_var, width=50).pack(side="left", padx=3)
+        qf = ctk.CTkFrame(config_frame, fg_color="transparent")
+        qf.grid(row=1, column=3, columnspan=2, padx=5, pady=5, sticky="w")
+        self.q_vars = {}
+        for q in ("Q1", "Q2", "Q3", "Q4"):
+            v = ctk.BooleanVar(value=q in ("Q1", "Q2"))
+            self.q_vars[q] = v
+            ctk.CTkCheckBox(qf, text=q, variable=v, width=50).pack(side="left", padx=4)
 
-        # ---- Queries ----
-        queries_frame = ctk.CTkFrame(self)
-        queries_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-        queries_frame.grid_columnconfigure(0, weight=1)
+        # ---- Tabs ----
+        self.tabs = ctk.CTkTabview(self)
+        self.tabs.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
 
-        ctk.CTkLabel(queries_frame, text="Search Queries (one per line):").grid(
-            row=0, column=0, padx=10, pady=(5, 0), sticky="w")
+        self.tab_search = self.tabs.add("Search")
+        self.tab_results = self.tabs.add("Results")
+        self.tab_downloads = self.tabs.add("Downloads")
 
-        self.queries_text = ctk.CTkTextbox(queries_frame, height=100)
-        self.queries_text.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-        self.queries_text.insert("1.0", "photoplethysmography peripheral arterial disease\n"
-                                        "PPG wearable sensor vascular detection\n"
-                                        "wearable blood flow monitoring device")
+        self._build_search_tab()
+        self._build_results_tab()
+        self._build_downloads_tab()
 
-        # Buttons
-        btn_frame = ctk.CTkFrame(queries_frame, fg_color="transparent")
-        btn_frame.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
+        # ---- Bottom ----
+        bot = ctk.CTkFrame(self)
+        bot.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
+        bot.grid_columnconfigure(0, weight=1)
 
-        self.search_btn = ctk.CTkButton(btn_frame, text="Search", command=self._start_search,
-                                        fg_color="#2563eb", width=120, height=35)
-        self.search_btn.pack(side="left", padx=5)
-
-        self.download_btn = ctk.CTkButton(btn_frame, text="Download PDFs",
-                                          command=self._start_download,
-                                          fg_color="#16a34a", width=140, height=35, state="disabled")
-        self.download_btn.pack(side="left", padx=5)
-
-        self.export_btn = ctk.CTkButton(btn_frame, text="Export CSV + BibTeX",
-                                        command=self._export,
-                                        fg_color="#9333ea", width=160, height=35, state="disabled")
-        self.export_btn.pack(side="left", padx=5)
-
-        self.stop_btn = ctk.CTkButton(btn_frame, text="Stop", command=self._stop,
-                                      fg_color="#dc2626", width=80, height=35, state="disabled")
-        self.stop_btn.pack(side="left", padx=5)
-
-        # API info label
-        self.api_label = ctk.CTkLabel(btn_frame, text="API: ~50,000 calls/day | 1 query = 1 call",
-                                      text_color="gray")
-        self.api_label.pack(side="right", padx=10)
-
-        # ---- Results ----
-        results_frame = ctk.CTkFrame(self)
-        results_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
-        results_frame.grid_columnconfigure(0, weight=1)
-        results_frame.grid_rowconfigure(0, weight=1)
-
-        self.results_text = ctk.CTkTextbox(results_frame, font=("Consolas", 12))
-        self.results_text.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
-        self.results_text.insert("1.0",
-            "Welcome to ScholarHarvest!\n\n"
-            "HOW TO USE:\n"
-            "  1. Enter your institutional email\n"
-            "  2. (Optional) Load Scimago CSV for quartile filtering\n"
-            "  3. Write your search queries (one per line)\n"
-            "  4. Click 'Search' to find articles\n"
-            "  5. Click 'Download PDFs' to get Open Access papers\n"
-            "  6. Click 'Export' to save CSV + BibTeX\n\n"
-            "API LIMITATIONS:\n"
-            "  - Free: ~50,000 API calls/day (resets midnight UTC)\n"
-            "  - Each query uses 1 API call (top 100 results)\n"
-            "  - Only Open Access PDFs are downloaded (legal)\n"
-            "  - Paid articles listed separately for institutional access\n\n"
-            "DATA SOURCE: OpenAlex (openalex.org) — CC0 metadata\n"
-            "QUARTILES: Scimago (scimagojr.com) — download CSV free\n"
-        )
-
-        # ---- Bottom: Progress ----
-        bottom_frame = ctk.CTkFrame(self)
-        bottom_frame.grid(row=3, column=0, padx=10, pady=(0, 10), sticky="ew")
-        bottom_frame.grid_columnconfigure(0, weight=1)
-
-        self.progress = ctk.CTkProgressBar(bottom_frame)
+        self.progress = ctk.CTkProgressBar(bot)
         self.progress.grid(row=0, column=0, padx=10, pady=5, sticky="ew")
         self.progress.set(0)
 
+        sf = ctk.CTkFrame(bot, fg_color="transparent")
+        sf.grid(row=1, column=0, padx=10, pady=(0, 5), sticky="ew")
+        sf.grid_columnconfigure(0, weight=1)
         self.status_var = ctk.StringVar(value="Ready")
-        ctk.CTkLabel(bottom_frame, textvariable=self.status_var).grid(
-            row=1, column=0, padx=10, pady=(0, 5), sticky="w")
+        ctk.CTkLabel(sf, textvariable=self.status_var, anchor="w").grid(row=0, column=0, sticky="w")
+        self.api_label = ctk.CTkLabel(sf, text="API: ~50,000 calls/day | Resets midnight UTC",
+                                      text_color="gray", anchor="e")
+        self.api_label.grid(row=0, column=1, sticky="e")
 
+    # ---- Search Tab ----
+    def _build_search_tab(self):
+        t = self.tab_search
+        t.grid_columnconfigure(0, weight=1)
+        t.grid_rowconfigure(1, weight=1)
+
+        ctk.CTkLabel(t, text="Search Queries (one per line):",
+                     font=("Segoe UI", 13, "bold")).grid(row=0, column=0, padx=10, pady=(5, 0), sticky="w")
+
+        self.queries_text = ctk.CTkTextbox(t, font=("Consolas", 12))
+        self.queries_text.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
+        self.queries_text.insert("1.0",
+            "photoplethysmography peripheral arterial disease\n"
+            "PPG wearable sensor vascular detection\n"
+            "wearable blood flow monitoring device")
+
+        bf = ctk.CTkFrame(t, fg_color="transparent")
+        bf.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
+
+        self.search_btn = ctk.CTkButton(bf, text="Search OpenAlex", command=self._start_search,
+                                        fg_color="#2563eb", width=150, height=38,
+                                        font=("Segoe UI", 13, "bold"))
+        self.search_btn.pack(side="left", padx=5)
+
+        self.stop_btn = ctk.CTkButton(bf, text="Stop", command=self._stop,
+                                      fg_color="#dc2626", width=80, height=38, state="disabled")
+        self.stop_btn.pack(side="left", padx=5)
+
+        self.search_info = ctk.CTkLabel(bf, text="", text_color="gray")
+        self.search_info.pack(side="right", padx=10)
+
+    # ---- Results Tab ----
+    def _build_results_tab(self):
+        t = self.tab_results
+        t.grid_columnconfigure(0, weight=1)
+        t.grid_rowconfigure(1, weight=1)
+
+        # Stats bar
+        self.stats_frame = ctk.CTkFrame(t)
+        self.stats_frame.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        self.stat_labels = {}
+        for i, (key, label) in enumerate([
+            ("total", "Total"), ("oa", "Open Access"), ("paywall", "Paywall"),
+            ("with_pdf", "PDF links"), ("q1", "Q1"), ("q2", "Q2")
+        ]):
+            ctk.CTkLabel(self.stats_frame, text=f"{label}:", font=("Segoe UI", 11)).grid(
+                row=0, column=i*2, padx=(10 if i == 0 else 5, 2), pady=5)
+            lbl = ctk.CTkLabel(self.stats_frame, text="0", font=("Segoe UI", 12, "bold"),
+                               text_color="#60a5fa")
+            lbl.grid(row=0, column=i*2+1, padx=(0, 10), pady=5)
+            self.stat_labels[key] = lbl
+
+        # Treeview
+        cols = ("title", "journal", "year", "quartile", "citations", "access", "pdf")
+        self.results_tree = ttk.Treeview(t, columns=cols, show="headings", style="Custom.Treeview")
+        self.results_tree.heading("title", text="Title")
+        self.results_tree.heading("journal", text="Journal")
+        self.results_tree.heading("year", text="Year")
+        self.results_tree.heading("quartile", text="Q")
+        self.results_tree.heading("citations", text="Cites")
+        self.results_tree.heading("access", text="Access")
+        self.results_tree.heading("pdf", text="PDF URL")
+
+        self.results_tree.column("title", width=350, minwidth=200)
+        self.results_tree.column("journal", width=200, minwidth=100)
+        self.results_tree.column("year", width=50, minwidth=40, anchor="center")
+        self.results_tree.column("quartile", width=35, minwidth=30, anchor="center")
+        self.results_tree.column("citations", width=55, minwidth=40, anchor="center")
+        self.results_tree.column("access", width=55, minwidth=40, anchor="center")
+        self.results_tree.column("pdf", width=80, minwidth=60, anchor="center")
+
+        scroll = ttk.Scrollbar(t, orient="vertical", command=self.results_tree.yview)
+        self.results_tree.configure(yscrollcommand=scroll.set)
+        self.results_tree.grid(row=1, column=0, padx=(5, 0), pady=5, sticky="nsew")
+        scroll.grid(row=1, column=1, pady=5, sticky="ns")
+
+        # Buttons
+        bf = ctk.CTkFrame(t, fg_color="transparent")
+        bf.grid(row=2, column=0, columnspan=2, padx=5, pady=5, sticky="ew")
+
+        ctk.CTkButton(bf, text="Export CSV + BibTeX", command=self._export,
+                      fg_color="#9333ea", width=160, height=35).pack(side="left", padx=5)
+
+    # ---- Downloads Tab ----
+    def _build_downloads_tab(self):
+        t = self.tab_downloads
+        t.grid_columnconfigure(0, weight=1)
+        t.grid_rowconfigure(2, weight=1)
+
+        # Controls
+        df = ctk.CTkFrame(t)
+        df.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+        self.verify_btn = ctk.CTkButton(df, text="1. Verify PDF Links", command=self._start_verify,
+                                        fg_color="#d97706", width=160, height=35,
+                                        font=("Segoe UI", 12, "bold"))
+        self.verify_btn.pack(side="left", padx=5, pady=5)
+
+        self.dl_btn = ctk.CTkButton(df, text="2. Download Verified PDFs", command=self._start_download,
+                                    fg_color="#16a34a", width=200, height=35, state="disabled",
+                                    font=("Segoe UI", 12, "bold"))
+        self.dl_btn.pack(side="left", padx=5, pady=5)
+
+        self.dl_info = ctk.CTkLabel(df, text="", text_color="gray")
+        self.dl_info.pack(side="right", padx=10)
+
+        # Download stats
+        self.dl_stats_frame = ctk.CTkFrame(t)
+        self.dl_stats_frame.grid(row=1, column=0, padx=5, pady=(0, 5), sticky="ew")
+        self.dl_stat_labels = {}
+        for i, (key, label, color) in enumerate([
+            ("verified", "Verified PDF", "#22c55e"),
+            ("html", "HTML/Paywall", "#ef4444"),
+            ("error", "Error/Timeout", "#f59e0b"),
+            ("downloaded", "Downloaded", "#3b82f6"),
+            ("failed", "Download Failed", "#ef4444"),
+        ]):
+            ctk.CTkLabel(self.dl_stats_frame, text=f"{label}:", font=("Segoe UI", 11)).grid(
+                row=0, column=i*2, padx=(10 if i == 0 else 5, 2), pady=5)
+            lbl = ctk.CTkLabel(self.dl_stats_frame, text="0",
+                               font=("Segoe UI", 12, "bold"), text_color=color)
+            lbl.grid(row=0, column=i*2+1, padx=(0, 10), pady=5)
+            self.dl_stat_labels[key] = lbl
+
+        # Download tree
+        dl_cols = ("title", "status", "reason", "http", "content_type", "size")
+        self.dl_tree = ttk.Treeview(t, columns=dl_cols, show="headings", style="Custom.Treeview")
+        self.dl_tree.heading("title", text="Title")
+        self.dl_tree.heading("status", text="Status")
+        self.dl_tree.heading("reason", text="Reason")
+        self.dl_tree.heading("http", text="HTTP")
+        self.dl_tree.heading("content_type", text="Content-Type")
+        self.dl_tree.heading("size", text="Size")
+
+        self.dl_tree.column("title", width=300, minwidth=150)
+        self.dl_tree.column("status", width=80, minwidth=60, anchor="center")
+        self.dl_tree.column("reason", width=200, minwidth=100)
+        self.dl_tree.column("http", width=45, minwidth=35, anchor="center")
+        self.dl_tree.column("content_type", width=150, minwidth=80)
+        self.dl_tree.column("size", width=60, minwidth=40, anchor="center")
+
+        dl_scroll = ttk.Scrollbar(t, orient="vertical", command=self.dl_tree.yview)
+        self.dl_tree.configure(yscrollcommand=dl_scroll.set)
+        self.dl_tree.grid(row=2, column=0, padx=(5, 0), pady=5, sticky="nsew")
+        dl_scroll.grid(row=2, column=1, pady=5, sticky="ns")
+
+    # ---- Helpers ----
     def _browse_scimago(self):
-        path = filedialog.askopenfilename(
-            title="Select Scimago CSV",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
-        )
+        path = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All", "*.*")])
         if path:
             self.scimago_var.set(path)
 
-    def _log(self, msg):
-        self.results_text.insert("end", msg + "\n")
-        self.results_text.see("end")
-
-    def _clear_log(self):
-        self.results_text.delete("1.0", "end")
-
     def _get_quartiles(self):
-        q = set()
-        if self.q1_var.get(): q.add("Q1")
-        if self.q2_var.get(): q.add("Q2")
-        if self.q3_var.get(): q.add("Q3")
-        if self.q4_var.get(): q.add("Q4")
-        return q
+        return {q for q, v in self.q_vars.items() if v.get()}
 
     def _get_queries(self):
-        text = self.queries_text.get("1.0", "end").strip()
-        return [q.strip() for q in text.split("\n") if q.strip()]
+        return [q.strip() for q in self.queries_text.get("1.0", "end").strip().split("\n") if q.strip()]
 
     def _set_running(self, running):
         self.running = running
-        state_normal = "normal" if not running else "disabled"
-        state_stop = "normal" if running else "disabled"
-        self.search_btn.configure(state=state_normal)
-        self.stop_btn.configure(state=state_stop)
-        if not running and self.corpus:
-            self.download_btn.configure(state="normal")
-            self.export_btn.configure(state="normal")
+        self.search_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
 
     def _stop(self):
         self.engine.stop_flag = True
         self.status_var.set("Stopping...")
 
+    def _update_stats(self):
+        n_oa = sum(1 for k in self.corpus if (k.get("open_access") or {}).get("is_oa"))
+        n_pdf = sum(1 for k in self.corpus if self.engine.pdf_url(k))
+        n_q1 = sum(1 for k in self.corpus if k.get("_quartile") == "Q1")
+        n_q2 = sum(1 for k in self.corpus if k.get("_quartile") == "Q2")
+        self.stat_labels["total"].configure(text=str(len(self.corpus)))
+        self.stat_labels["oa"].configure(text=str(n_oa))
+        self.stat_labels["paywall"].configure(text=str(len(self.corpus) - n_oa))
+        self.stat_labels["with_pdf"].configure(text=str(n_pdf))
+        self.stat_labels["q1"].configure(text=str(n_q1))
+        self.stat_labels["q2"].configure(text=str(n_q2))
+
     # ---- Search ----
     def _start_search(self):
         email = self.email_var.get().strip()
         if not email:
-            messagebox.showerror("Error", "Email is required for API access.")
+            messagebox.showerror("Error", "Email required for API access.")
             return
         queries = self._get_queries()
         if not queries:
-            messagebox.showerror("Error", "Enter at least one search query.")
+            messagebox.showerror("Error", "Enter at least one query.")
             return
-
+        self.search_info.configure(text=f"{len(queries)} queries = {len(queries)} API calls")
         self.engine.stop_flag = False
         self._set_running(True)
         threading.Thread(target=self._run_search, args=(email, queries), daemon=True).start()
 
     def _run_search(self, email, queries):
-        self._clear_log()
-        self._log(f"ScholarHarvest v{__version__}")
-        self._log("=" * 55)
-
-        # Check API
-        self.status_var.set("Checking API...")
+        self.status_var.set("Checking API budget...")
         ok, msg = self.engine.check_api(email)
         if not ok:
-            self._log(f"\nAPI ERROR: {msg}")
-            self._log("Budget resets at midnight UTC (~7PM Colombia)")
+            self.status_var.set(f"API unavailable: {msg}")
+            messagebox.showerror("API Error", msg)
             self._set_running(False)
             return
-        self._log(f"API: Available")
 
-        # Load Scimago
         scimago_path = self.scimago_var.get().strip()
         if scimago_path:
             self.status_var.set("Loading Scimago...")
             n = self.engine.load_scimago(scimago_path)
-            if n > 0:
-                self._log(f"Scimago: {n} ISSNs loaded")
-            elif n == -1:
-                self._log("Scimago: Could not parse CSV columns")
-            else:
-                self._log("Scimago: File not found")
-        else:
-            self._log("Scimago: Not loaded (no quartile filter)")
+            if n <= 0:
+                self.status_var.set("Scimago not loaded — no quartile filter")
 
         quartiles = self._get_quartiles()
         year_from = int(self.year_from_var.get())
         year_to = int(self.year_to_var.get())
 
-        self._log(f"\nQuartiles: {', '.join(sorted(quartiles)) if quartiles else 'All'}")
-        self._log(f"Years: {year_from}-{year_to}")
-        self._log(f"Queries: {len(queries)} (~{len(queries)} API calls)")
-        self._log("=" * 55 + "\n")
-
         seen = set()
         self.corpus = []
+        self.results_tree.delete(*self.results_tree.get_children())
 
         for i, query in enumerate(queries):
             if self.engine.stop_flag:
-                self._log("\nStopped by user.")
                 break
+            self.status_var.set(f"[{i+1}/{len(queries)}] {query[:50]}...")
+            self.progress.set(i / len(queries))
 
-            self.status_var.set(f"Searching {i+1}/{len(queries)}: {query[:40]}...")
-            self.progress.set((i) / len(queries))
-
-            results = self.engine.search(query, seen, quartiles, email,
-                                         100, year_from, year_to)
-
+            results = self.engine.search(query, seen, quartiles, email, 100, year_from, year_to)
             if results is None:
-                self._log(f"\nBUDGET EXHAUSTED — resets midnight UTC")
+                self.status_var.set("Daily budget exhausted — retry after midnight UTC")
+                messagebox.showwarning("Budget", "API budget exhausted.\nResets at midnight UTC (~7PM Colombia).")
                 break
 
             self.corpus.extend(results)
-            self._log(f"[{i+1}/{len(queries)}] {query}")
-            self._log(f"         +{len(results)} new (total: {len(self.corpus)})")
+            for w in results:
+                is_oa = (w.get("open_access") or {}).get("is_oa", False)
+                has_pdf = "Yes" if self.engine.pdf_url(w) else "No"
+                self.results_tree.insert("", "end", values=(
+                    (w.get("title") or "")[:80],
+                    self.engine.journal_str(w)[:40],
+                    w.get("publication_year", ""),
+                    w.get("_quartile", "?"),
+                    w.get("cited_by_count", 0),
+                    "OA" if is_oa else "Paid",
+                    has_pdf,
+                ))
 
         self.corpus.sort(key=lambda w: w.get("cited_by_count", 0), reverse=True)
+        self.results_tree.delete(*self.results_tree.get_children())
+        for w in self.corpus:
+            is_oa = (w.get("open_access") or {}).get("is_oa", False)
+            has_pdf = "Yes" if self.engine.pdf_url(w) else "No"
+            self.results_tree.insert("", "end", values=(
+                (w.get("title") or "")[:80],
+                self.engine.journal_str(w)[:40],
+                w.get("publication_year", ""),
+                w.get("_quartile", "?"),
+                w.get("cited_by_count", 0),
+                "OA" if is_oa else "Paid",
+                has_pdf,
+            ))
+
+        self._update_stats()
         self.progress.set(1.0)
-
-        # Summary
-        n_oa = sum(1 for k in self.corpus if (k.get("open_access") or {}).get("is_oa"))
-        n_pdf = sum(1 for k in self.corpus if self.engine.pdf_url(k))
-
-        self._log(f"\n{'='*55}")
-        self._log(f"RESULTS: {len(self.corpus)} articles")
-        self._log(f"  Open Access:    {n_oa}")
-        self._log(f"  Paywall:        {len(self.corpus) - n_oa}")
-        self._log(f"  With PDF link:  {n_pdf}")
-        self._log(f"{'='*55}")
-
+        self.status_var.set(f"Found {len(self.corpus)} articles")
         if self.corpus:
-            self._log(f"\nTop 10 most cited:")
-            for k in self.corpus[:10]:
-                c = k.get("cited_by_count", 0)
-                q = k.get("_quartile", "?")
-                t = (k.get("title") or "")[:70]
-                self._log(f"  [{q}] {c:>5} cites | {t}")
+            self.verify_btn.configure(state="normal")
+            self.tabs.set("Results")
+        self._set_running(False)
 
-        self.status_var.set(f"Done: {len(self.corpus)} articles found")
+    # ---- Verify PDF Links ----
+    def _start_verify(self):
+        if not self.corpus:
+            return
+        self.engine.stop_flag = False
+        self._set_running(True)
+        self.dl_tree.delete(*self.dl_tree.get_children())
+        threading.Thread(target=self._run_verify, daemon=True).start()
+
+    def _run_verify(self):
+        candidates = [(w, self.engine.pdf_url(w)) for w in self.corpus if self.engine.pdf_url(w)]
+        self.status_var.set(f"Verifying {len(candidates)} PDF links...")
+        self.tabs.set("Downloads")
+
+        self.pdf_jobs = []
+        verified = html = errors = 0
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(self.engine.verify_pdf_url, url): (w, url)
+                       for w, url in candidates}
+            for i, fut in enumerate(as_completed(futures)):
+                if self.engine.stop_flag:
+                    break
+                w, url = futures[fut]
+                info = fut.result()
+                title = (w.get("title") or "")[:60]
+                size_str = f"{info['size_kb']} KB" if info.get("size_kb") else "—"
+
+                if info["downloadable"]:
+                    status_text = "PDF"
+                    verified += 1
+                    self.pdf_jobs.append((w, url))
+                elif "html" in info.get("reason", "").lower() or "paywall" in info.get("reason", "").lower():
+                    status_text = "SKIP"
+                    html += 1
+                else:
+                    status_text = "ERROR"
+                    errors += 1
+
+                self.dl_tree.insert("", "0" if info["downloadable"] else "end", values=(
+                    title, status_text, info["reason"],
+                    info.get("http", ""), info.get("content_type", "")[:35], size_str
+                ))
+
+                done = i + 1
+                self.progress.set(done / len(candidates))
+                self.status_var.set(f"Verifying: {done}/{len(candidates)} | "
+                                   f"PDF: {verified} | Skip: {html} | Error: {errors}")
+
+                self.dl_stat_labels["verified"].configure(text=str(verified))
+                self.dl_stat_labels["html"].configure(text=str(html))
+                self.dl_stat_labels["error"].configure(text=str(errors))
+
+        self.progress.set(1.0)
+        self.dl_info.configure(text=f"{verified} PDFs ready to download")
+        self.status_var.set(f"Verification done: {verified} downloadable, {html} paywalls, {errors} errors")
+
+        if self.pdf_jobs:
+            self.dl_btn.configure(state="normal")
         self._set_running(False)
 
     # ---- Download PDFs ----
     def _start_download(self):
-        if not self.corpus:
+        if not self.pdf_jobs:
             return
         out_dir = filedialog.askdirectory(title="Select folder for PDFs")
         if not out_dir:
@@ -518,62 +716,52 @@ class App(ctk.CTk):
         pdf_dir.mkdir(parents=True, exist_ok=True)
 
         jobs = []
-        already = 0
-        for w in self.corpus:
-            url = self.engine.pdf_url(w)
-            if not url:
-                continue
+        for w, url in self.pdf_jobs:
             doi = (w.get("doi") or w.get("id", "")).split("/")[-1]
             safe = re.sub(r"[^A-Za-z0-9._-]", "_", doi)[:80]
             dest = pdf_dir / f"{safe}.pdf"
-            if dest.exists() and self.engine.is_valid_pdf(dest):
-                already += 1
-                continue
-            jobs.append((url, dest))
+            jobs.append((w, url, dest))
 
-        self._log(f"\nPDF DOWNLOAD")
-        self._log(f"  Already downloaded: {already}")
-        self._log(f"  Queued: {len(jobs)}")
-        self._log(f"  Destination: {pdf_dir}")
+        self.status_var.set(f"Downloading {len(jobs)} verified PDFs...")
+        downloaded = failed = 0
 
-        if not jobs:
-            self._log("  Nothing to download!")
-            self._set_running(False)
-            return
-
-        ok = errors = 0
         with ThreadPoolExecutor(max_workers=6) as pool:
-            futures = {pool.submit(self.engine.download_pdf, url, dest): i
-                       for i, (url, dest) in enumerate(jobs)}
+            futures = {pool.submit(self.engine.download_pdf, url, dest): (i, w)
+                       for i, (w, url, dest) in enumerate(jobs)}
             for fut in as_completed(futures):
                 if self.engine.stop_flag:
                     break
-                idx = futures[fut]
+                idx, w = futures[fut]
                 result = fut.result()
-                if result == "ok":
-                    ok += 1
-                elif result in ("error", "not_pdf", "invalid"):
-                    errors += 1
+
+                if result["status"] in ("ok", "exists"):
+                    downloaded += 1
+                else:
+                    failed += 1
+
                 done = idx + 1
                 self.progress.set(done / len(jobs))
-                self.status_var.set(f"PDFs: {done}/{len(jobs)} | OK: {ok} | Errors: {errors}")
+                self.status_var.set(f"Downloading: {done}/{len(jobs)} | "
+                                   f"OK: {downloaded} | Failed: {failed}")
+                self.dl_stat_labels["downloaded"].configure(text=str(downloaded))
+                self.dl_stat_labels["failed"].configure(text=str(failed))
 
-        self._log(f"\n  Downloaded: {ok}")
-        self._log(f"  Failed: {errors}")
-        self._log(f"  Total in folder: {already + ok}")
-        self.status_var.set(f"PDFs done: {already + ok} total")
+        self.progress.set(1.0)
+        self.status_var.set(f"Done: {downloaded} PDFs in {pdf_dir}")
+        messagebox.showinfo("Download Complete",
+                           f"Downloaded: {downloaded}\nFailed: {failed}\nFolder: {pdf_dir}")
         self._set_running(False)
 
     # ---- Export ----
     def _export(self):
         if not self.corpus:
+            messagebox.showinfo("Info", "Search first.")
             return
         out_dir = filedialog.askdirectory(title="Select export folder")
         if not out_dir:
             return
         out = Path(out_dir)
 
-        # CSV
         csv_path = out / "corpus_metadata.csv"
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -582,59 +770,41 @@ class App(ctk.CTk):
             for k in self.corpus:
                 try:
                     w.writerow([
-                        k.get("id", ""),
-                        (k.get("doi") or "").replace("https://doi.org/", ""),
-                        k.get("title", ""),
-                        self.engine.authors_str(k),
-                        self.engine.journal_str(k),
-                        k.get("publication_year", ""),
-                        k.get("_quartile", ""),
-                        k.get("cited_by_count", ""),
-                        (k.get("open_access") or {}).get("is_oa", False),
+                        k.get("id", ""), (k.get("doi") or "").replace("https://doi.org/", ""),
+                        k.get("title", ""), self.engine.authors_str(k), self.engine.journal_str(k),
+                        k.get("publication_year", ""), k.get("_quartile", ""),
+                        k.get("cited_by_count", ""), (k.get("open_access") or {}).get("is_oa", False),
                         self.engine.pdf_url(k) or "",
                         self.engine.rebuild_abstract(k.get("abstract_inverted_index")),
                     ])
                 except Exception:
                     continue
 
-        # BibTeX
         bib_path = out / "corpus.bib"
         with open(bib_path, "w", encoding="utf-8") as f:
             def esc(s):
                 return (s or "").replace("{", "").replace("}", "").replace("&", "\\&")
             for i, k in enumerate(self.corpus, 1):
                 doi = (k.get("doi") or "").replace("https://doi.org/", "")
-                f.write(
-                    f"@article{{ref{i:05d},\n"
-                    f"  title = {{{esc(k.get('title'))}}},\n"
-                    f"  author = {{{esc(self.engine.authors_str(k))}}},\n"
-                    f"  journal = {{{esc(self.engine.journal_str(k))}}},\n"
-                    f"  year = {{{k.get('publication_year','')}}},\n"
-                    f"  doi = {{{doi}}},\n"
-                    f"}}\n"
-                )
+                f.write(f"@article{{ref{i:05d},\n  title = {{{esc(k.get('title'))}}},\n"
+                        f"  author = {{{esc(self.engine.authors_str(k))}}},\n"
+                        f"  journal = {{{esc(self.engine.journal_str(k))}}},\n"
+                        f"  year = {{{k.get('publication_year','')}}},\n  doi = {{{doi}}},\n}}\n")
 
-        # Paywall list
         closed = [k for k in self.corpus if not (k.get("open_access") or {}).get("is_oa")]
         pay_path = out / "paywall_articles.csv"
         with open(pay_path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["doi", "title", "journal", "year", "quartile", "citations"])
             for k in closed:
-                w.writerow([
-                    (k.get("doi") or "").replace("https://doi.org/", ""),
-                    k.get("title", ""), self.engine.journal_str(k),
-                    k.get("publication_year", ""), k.get("_quartile", ""),
-                    k.get("cited_by_count", ""),
-                ])
+                w.writerow([(k.get("doi") or "").replace("https://doi.org/", ""),
+                            k.get("title", ""), self.engine.journal_str(k),
+                            k.get("publication_year", ""), k.get("_quartile", ""), k.get("cited_by_count", "")])
 
-        self._log(f"\nEXPORTED to {out}")
-        self._log(f"  CSV:     {csv_path.name} ({len(self.corpus)} articles)")
-        self._log(f"  BibTeX:  {bib_path.name}")
-        self._log(f"  Paywall: {pay_path.name} ({len(closed)} articles)")
-        self.status_var.set(f"Exported to {out}")
+        self.status_var.set(f"Exported {len(self.corpus)} articles to {out}")
         messagebox.showinfo("Export Complete",
-                           f"Saved {len(self.corpus)} articles to:\n{out}")
+                           f"CSV: {csv_path.name}\nBibTeX: {bib_path.name}\n"
+                           f"Paywall: {pay_path.name} ({len(closed)} articles)\n\nFolder: {out}")
 
 
 if __name__ == "__main__":
