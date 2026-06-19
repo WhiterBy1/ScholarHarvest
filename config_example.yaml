@@ -1,0 +1,35 @@
+# ScholarHarvest — Example Configuration
+# Copy this file to config.yaml and edit your values.
+
+# Your institutional email (required for OpenAlex polite pool)
+email: "your.email@university.edu"
+
+# Path to Scimago CSV (download from https://www.scimagojr.com/journalrank.php)
+# Leave empty to skip quartile filtering
+scimago_csv: "scimagojr 2025.csv"
+
+# Accepted quartiles (Q1, Q2, Q3, Q4)
+quartiles: ["Q1", "Q2"]
+
+# Year range
+year_from: 2000
+year_to: 2026
+
+# Max results per query (100 = 1 API call, no pagination needed)
+top_per_query: 100
+
+# Download Open Access PDFs?
+download_pdfs: true
+
+# Parallel threads for PDF download
+pdf_threads: 6
+
+# Search queries — one per line
+queries:
+  - "photoplethysmography peripheral arterial disease"
+  - "PPG wearable sensor vascular detection"
+  - "wearable blood flow monitoring device"
+  - "machine learning PPG signal classification"
+
+# Output directory
+output_dir: "output"
