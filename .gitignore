@@ -7,3 +7,6 @@ output/
 _progreso.json
 .env
 .DS_Store
+build/
+dist/
+*.spec
