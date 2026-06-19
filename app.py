@@ -23,9 +23,19 @@ import requests
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-__version__ = "3.1.0"
+__version__ = "4.0.0"
 OPENALEX = "https://api.openalex.org/works"
 OPENALEX_AUTHORS = "https://api.openalex.org/authors"
+
+
+def bundled_path(filename):
+    """Get path to a file bundled with the .exe, or next to the script."""
+    if getattr(sys, '_MEIPASS', None):
+        return Path(sys._MEIPASS) / filename
+    return Path(__file__).parent / filename
+
+
+DEFAULT_SCIMAGO = bundled_path("scimagojr 2025.csv")
 
 
 # ============================================================================
@@ -89,61 +99,89 @@ class HarvestEngine:
         except Exception as e:
             return False, str(e)
 
-    def search(self, query, seen, quartiles_ok, email, top_n, year_from, year_to):
+    def search(self, query, seen, quartiles_ok, email, max_results, year_from, year_to,
+               on_progress=None):
+        """Search with cursor pagination. Returns up to max_results articles."""
         if self.stop_flag:
             return []
         filters = [f"from_publication_date:{year_from}-01-01",
                    f"to_publication_date:{year_to}-12-31",
                    "is_paratext:false", "type:article"]
+        per_page = min(max_results, 200)
         params = {
             "search": query,
             "filter": ",".join(filters),
-            "per-page": top_n,
+            "per-page": per_page,
             "sort": "cited_by_count:desc",
+            "cursor": "*",
             "mailto": email,
             "select": ("id,doi,title,publication_year,cited_by_count,"
                        "authorships,primary_location,open_access,"
                        "best_oa_location,abstract_inverted_index,language,type"),
         }
-        time.sleep(3 + random.uniform(0, 2))
-        for attempt in range(6):
+
+        all_results = []
+        page = 0
+        while len(all_results) < max_results:
             if self.stop_flag:
-                return []
-            try:
-                r = self.session.get(OPENALEX, params=params, timeout=90)
-                if r.status_code == 429:
-                    body = r.json() if "json" in r.headers.get("content-type", "") else {}
-                    if "budget" in body.get("message", "").lower():
-                        return None
-                    time.sleep(min(15 * (2 ** attempt), 300) + random.uniform(2, 8))
-                    continue
-                if r.status_code >= 500:
-                    time.sleep(10 * (attempt + 1))
-                    continue
-                r.raise_for_status()
-                data = r.json()
-                results = []
-                filter_q = len(self.scimago) > 0 and quartiles_ok
-                for w in data.get("results", []):
-                    wid = w.get("id")
-                    if not wid or wid in seen:
+                break
+            page += 1
+            time.sleep(3 + random.uniform(0, 2))
+
+            data = None
+            for attempt in range(6):
+                if self.stop_flag:
+                    break
+                try:
+                    r = self.session.get(OPENALEX, params=params, timeout=90)
+                    if r.status_code == 429:
+                        body = r.json() if "json" in r.headers.get("content-type", "") else {}
+                        if "budget" in body.get("message", "").lower():
+                            return None if not all_results else all_results
+                        time.sleep(min(15 * (2 ** attempt), 300) + random.uniform(2, 8))
                         continue
-                    if filter_q:
-                        q = self.get_quartile(w)
-                        if q not in quartiles_ok:
-                            continue
-                        w["_quartile"] = q
+                    if r.status_code >= 500:
+                        time.sleep(10 * (attempt + 1))
+                        continue
+                    r.raise_for_status()
+                    data = r.json()
+                    break
+                except Exception:
+                    if attempt < 5:
+                        time.sleep(5 * (attempt + 1))
                     else:
-                        w["_quartile"] = "NA"
-                    seen.add(wid)
-                    results.append(w)
-                return results
-            except Exception:
-                if attempt < 5:
-                    time.sleep(5 * (attempt + 1))
+                        return all_results if all_results else []
+
+            if not data:
+                break
+
+            filter_q = len(self.scimago) > 0 and quartiles_ok
+            page_results = data.get("results", [])
+            for w in page_results:
+                if len(all_results) >= max_results:
+                    break
+                wid = w.get("id")
+                if not wid or wid in seen:
+                    continue
+                if filter_q:
+                    q = self.get_quartile(w)
+                    if q not in quartiles_ok:
+                        continue
+                    w["_quartile"] = q
                 else:
-                    return []
-        return []
+                    w["_quartile"] = "NA"
+                seen.add(wid)
+                all_results.append(w)
+
+            if on_progress:
+                on_progress(len(all_results))
+
+            cursor = data.get("meta", {}).get("next_cursor")
+            if not cursor or not page_results:
+                break
+            params["cursor"] = cursor
+
+        return all_results
 
     def verify_pdf_url(self, url):
         """HEAD request to check if URL actually serves a PDF."""
@@ -410,9 +448,10 @@ class App(ctk.CTk):
                      placeholder_text="you@university.edu", width=280).grid(row=0, column=1, padx=5, pady=5, sticky="w")
 
         ctk.CTkLabel(config_frame, text="Scimago:").grid(row=0, column=2, padx=10, pady=5, sticky="w")
-        self.scimago_var = ctk.StringVar()
+        default_sci = str(DEFAULT_SCIMAGO) if DEFAULT_SCIMAGO.exists() else ""
+        self.scimago_var = ctk.StringVar(value=default_sci)
         ctk.CTkEntry(config_frame, textvariable=self.scimago_var, width=220,
-                     placeholder_text="(optional)").grid(row=0, column=3, padx=5, pady=5, sticky="w")
+                     placeholder_text="(built-in loaded)").grid(row=0, column=3, padx=5, pady=5, sticky="w")
         ctk.CTkButton(config_frame, text="...", width=35,
                       command=self._browse_scimago).grid(row=0, column=4, padx=5, pady=5)
 
@@ -434,6 +473,16 @@ class App(ctk.CTk):
             v = ctk.BooleanVar(value=q in ("Q1", "Q2"))
             self.q_vars[q] = v
             ctk.CTkCheckBox(qf, text=q, variable=v, width=50).pack(side="left", padx=4)
+
+        # Row 3: Max results
+        ctk.CTkLabel(config_frame, text="Max results/query:").grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        self.max_results_var = ctk.StringVar(value="100")
+        max_menu = ctk.CTkOptionMenu(config_frame, variable=self.max_results_var,
+                                      values=["100", "500", "1000", "5000", "10000", "20000"],
+                                      width=120)
+        max_menu.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+        ctk.CTkLabel(config_frame, text="100 = 1 API call | 1000 = ~5 calls | 20000 = ~100 calls per query",
+                     text_color="gray", font=("Segoe UI", 10)).grid(row=2, column=2, columnspan=3, padx=10, pady=5, sticky="w")
 
         # ---- Tabs ----
         self.tabs = ctk.CTkTabview(self)
@@ -478,10 +527,7 @@ class App(ctk.CTk):
 
         self.queries_text = ctk.CTkTextbox(t, font=("Consolas", 12))
         self.queries_text.grid(row=1, column=0, padx=10, pady=5, sticky="nsew")
-        self.queries_text.insert("1.0",
-            "photoplethysmography peripheral arterial disease\n"
-            "PPG wearable sensor vascular detection\n"
-            "wearable blood flow monitoring device")
+        self.queries_text.insert("1.0", "")
 
         bf = ctk.CTkFrame(t, fg_color="transparent")
         bf.grid(row=2, column=0, padx=10, pady=5, sticky="ew")
@@ -575,6 +621,11 @@ class App(ctk.CTk):
                                                command=self._export_authors,
                                                fg_color="#9333ea", width=150, height=35, state="disabled")
         self.author_export_btn.pack(side="left", padx=5, pady=5)
+
+        self.dl_by_author_btn = ctk.CTkButton(af, text="Download PDFs by Author Rank",
+                                              command=self._start_download_by_author,
+                                              fg_color="#16a34a", width=230, height=35, state="disabled")
+        self.dl_by_author_btn.pack(side="left", padx=5, pady=5)
 
         self.author_info = ctk.CTkLabel(af, text="", text_color="gray")
         self.author_info.pack(side="right", padx=10)
@@ -672,6 +723,7 @@ class App(ctk.CTk):
 
         self.hindex_btn.configure(state="normal")
         self.author_export_btn.configure(state="normal")
+        self.dl_by_author_btn.configure(state="normal")
         self.author_info.configure(
             text=f"Score = papers*2 + avg_cites + Q1*5 + Q2*2 | h-index columns empty until fetched")
         self.status_var.set(f"Analyzed {len(self.author_data)} authors")
@@ -786,6 +838,102 @@ class App(ctk.CTk):
                 ])
         self.status_var.set(f"Authors exported to {csv_path}")
         messagebox.showinfo("Export", f"Authors ranking saved:\n{csv_path}\n\n{len(self.author_data)} authors")
+
+    def _start_download_by_author(self):
+        """Download PDFs ordered by author relevance score."""
+        if not self.author_data or not self.corpus:
+            return
+        out_dir = filedialog.askdirectory(title="Select folder for PDFs (by author rank)")
+        if not out_dir:
+            return
+        self.engine.stop_flag = False
+        self._set_running(True)
+        threading.Thread(target=self._run_download_by_author, args=(Path(out_dir),), daemon=True).start()
+
+    def _run_download_by_author(self, pdf_dir):
+        pdf_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build author_id -> score lookup
+        author_scores = {}
+        for a in self.author_data:
+            if a.get("id"):
+                author_scores[a["id"]] = a["score"]
+
+        # Score each paper by its best author's score
+        def paper_author_score(w):
+            best = 0
+            for a in w.get("authorships", []):
+                aid = (a.get("author") or {}).get("id", "")
+                s = author_scores.get(aid, 0)
+                if s > best:
+                    best = s
+            return best
+
+        # Sort corpus by author relevance
+        sorted_corpus = sorted(self.corpus, key=paper_author_score, reverse=True)
+
+        # Build download jobs (only OA with PDF url)
+        jobs = []
+        for w in sorted_corpus:
+            url = self.engine.pdf_url(w)
+            if not url:
+                continue
+            doi = (w.get("doi") or w.get("id", "")).split("/")[-1]
+            safe = re.sub(r"[^A-Za-z0-9._-]", "_", doi)[:80]
+            dest = pdf_dir / f"{safe}.pdf"
+            if dest.exists() and self.engine._is_valid_pdf(dest):
+                continue
+            best_author = ""
+            best_score = 0
+            for a in w.get("authorships", []):
+                aid = (a.get("author") or {}).get("id", "")
+                s = author_scores.get(aid, 0)
+                if s > best_score:
+                    best_score = s
+                    best_author = (a.get("author") or {}).get("display_name", "")
+            jobs.append((w, url, dest, best_author, best_score))
+
+        self.status_var.set(f"Downloading {len(jobs)} PDFs (by author relevance)...")
+        self.tabs.set("Downloads")
+        self.dl_tree.delete(*self.dl_tree.get_children())
+
+        downloaded = failed = 0
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = {pool.submit(self.engine.download_pdf, url, dest): (i, w, best_author, best_score)
+                       for i, (w, url, dest, best_author, best_score) in enumerate(jobs)}
+            for fut in as_completed(futures):
+                if self.engine.stop_flag:
+                    break
+                idx, w, author_name, score = futures[fut]
+                result = fut.result()
+                title = (w.get("title") or "")[:50]
+
+                if result["status"] in ("ok", "exists"):
+                    downloaded += 1
+                    status_text = "OK"
+                else:
+                    failed += 1
+                    status_text = "FAIL"
+
+                size_str = f"{result.get('size_kb', '')} KB" if result.get("size_kb") else "—"
+                self.dl_tree.insert("", "end", values=(
+                    title, status_text,
+                    f"Author: {author_name[:25]} (score {score:.0f})",
+                    "", "", size_str
+                ))
+
+                done = idx + 1
+                self.progress.set(done / len(jobs))
+                self.status_var.set(f"By author rank: {done}/{len(jobs)} | OK: {downloaded} | Failed: {failed}")
+                self.dl_stat_labels["downloaded"].configure(text=str(downloaded))
+                self.dl_stat_labels["failed"].configure(text=str(failed))
+
+        self.progress.set(1.0)
+        self.status_var.set(f"Done: {downloaded} PDFs by author relevance in {pdf_dir}")
+        messagebox.showinfo("Download Complete",
+                           f"Downloaded: {downloaded}\nFailed: {failed}\n"
+                           f"Order: Most relevant authors first\nFolder: {pdf_dir}")
+        self._set_running(False)
 
     # ---- Downloads Tab ----
     def _build_downloads_tab(self):
@@ -918,6 +1066,7 @@ class App(ctk.CTk):
         quartiles = self._get_quartiles()
         year_from = int(self.year_from_var.get())
         year_to = int(self.year_to_var.get())
+        max_results = int(self.max_results_var.get())
 
         seen = set()
         self.corpus = []
@@ -926,10 +1075,15 @@ class App(ctk.CTk):
         for i, query in enumerate(queries):
             if self.engine.stop_flag:
                 break
+
+            def on_progress(n, qi=i, q=query):
+                self.status_var.set(f"[{qi+1}/{len(queries)}] {q[:40]}... ({n} found)")
+
             self.status_var.set(f"[{i+1}/{len(queries)}] {query[:50]}...")
             self.progress.set(i / len(queries))
 
-            results = self.engine.search(query, seen, quartiles, email, 100, year_from, year_to)
+            results = self.engine.search(query, seen, quartiles, email,
+                                         max_results, year_from, year_to, on_progress)
             if results is None:
                 self.status_var.set("Daily budget exhausted — retry after midnight UTC")
                 messagebox.showwarning("Budget", "API budget exhausted.\nResets at midnight UTC (~7PM Colombia).")
