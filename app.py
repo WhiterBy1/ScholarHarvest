@@ -23,8 +23,9 @@ import requests
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-__version__ = "2.0.0"
+__version__ = "3.0.0"
 OPENALEX = "https://api.openalex.org/works"
+OPENALEX_AUTHORS = "https://api.openalex.org/authors"
 
 
 # ============================================================================
@@ -221,6 +222,75 @@ class HarvestEngine:
                 return {"status": "error", "size_kb": None, "detail": str(e)[:60]}
         return {"status": "error", "size_kb": None}
 
+    def fetch_author_details(self, author_id, email):
+        """Fetch h-index, works_count, cited_by_count from OpenAlex /authors endpoint."""
+        try:
+            time.sleep(0.3 + random.uniform(0, 0.3))
+            r = self.session.get(author_id, params={"mailto": email,
+                "select": "id,display_name,summary_stats,works_count,cited_by_count"}, timeout=20)
+            if r.status_code == 429:
+                return None
+            if r.status_code != 200:
+                return {"h_index": "?", "works": "?", "global_cited": "?"}
+            data = r.json()
+            stats = data.get("summary_stats") or {}
+            return {
+                "h_index": stats.get("h_index", "?"),
+                "works": data.get("works_count", "?"),
+                "global_cited": data.get("cited_by_count", "?"),
+            }
+        except Exception:
+            return {"h_index": "?", "works": "?", "global_cited": "?"}
+
+    def analyze_authors(self, corpus):
+        """Analyze authors from corpus data (no API calls)."""
+        authors = {}
+        for w in corpus:
+            cites = w.get("cited_by_count", 0)
+            quartile = w.get("_quartile", "")
+            for a in w.get("authorships", []):
+                author = a.get("author") or {}
+                aid = author.get("id", "")
+                name = author.get("display_name", "")
+                if not name:
+                    continue
+                if aid not in authors:
+                    authors[aid] = {
+                        "id": aid, "name": name,
+                        "papers": 0, "total_cites": 0,
+                        "q1_papers": 0, "q2_papers": 0,
+                        "journals": set(), "years": [],
+                        "best_quartile": "Q4",
+                        "h_index": None, "works": None, "global_cited": None,
+                    }
+                rec = authors[aid]
+                rec["papers"] += 1
+                rec["total_cites"] += cites
+                if quartile == "Q1":
+                    rec["q1_papers"] += 1
+                if quartile == "Q2":
+                    rec["q2_papers"] += 1
+                if quartile and quartile < rec["best_quartile"]:
+                    rec["best_quartile"] = quartile
+                journal = self.journal_str(w)
+                if journal:
+                    rec["journals"].add(journal)
+                y = w.get("publication_year")
+                if y:
+                    rec["years"].append(y)
+
+        result = []
+        for rec in authors.values():
+            rec["avg_cites"] = round(rec["total_cites"] / rec["papers"], 1) if rec["papers"] else 0
+            rec["journals_count"] = len(rec["journals"])
+            rec["year_range"] = f"{min(rec['years'])}-{max(rec['years'])}" if rec["years"] else ""
+            # Score: papers in corpus * 2 + avg_cites + Q1 papers * 5 + Q2 papers * 2
+            rec["score"] = rec["papers"] * 2 + rec["avg_cites"] + rec["q1_papers"] * 5 + rec["q2_papers"] * 2
+            result.append(rec)
+
+        result.sort(key=lambda x: x["score"], reverse=True)
+        return result
+
     @staticmethod
     def _is_valid_pdf(path):
         try:
@@ -349,10 +419,12 @@ class App(ctk.CTk):
 
         self.tab_search = self.tabs.add("Search")
         self.tab_results = self.tabs.add("Results")
+        self.tab_authors = self.tabs.add("Authors")
         self.tab_downloads = self.tabs.add("Downloads")
 
         self._build_search_tab()
         self._build_results_tab()
+        self._build_authors_tab()
         self._build_downloads_tab()
 
         # ---- Bottom ----
@@ -455,6 +527,241 @@ class App(ctk.CTk):
 
         ctk.CTkButton(bf, text="Export CSV + BibTeX", command=self._export,
                       fg_color="#9333ea", width=160, height=35).pack(side="left", padx=5)
+
+    # ---- Authors Tab ----
+    def _build_authors_tab(self):
+        t = self.tab_authors
+        t.grid_columnconfigure(0, weight=1)
+        t.grid_rowconfigure(2, weight=1)
+
+        # Controls
+        af = ctk.CTkFrame(t)
+        af.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+
+        self.analyze_btn = ctk.CTkButton(af, text="Analyze Authors", command=self._start_analyze,
+                                         fg_color="#2563eb", width=150, height=35,
+                                         font=("Segoe UI", 12, "bold"))
+        self.analyze_btn.pack(side="left", padx=5, pady=5)
+
+        self.hindex_btn = ctk.CTkButton(af, text="Fetch h-index (optional, uses API)",
+                                        command=self._start_hindex,
+                                        fg_color="#d97706", width=250, height=35, state="disabled")
+        self.hindex_btn.pack(side="left", padx=5, pady=5)
+
+        self.author_export_btn = ctk.CTkButton(af, text="Export Authors CSV",
+                                               command=self._export_authors,
+                                               fg_color="#9333ea", width=150, height=35, state="disabled")
+        self.author_export_btn.pack(side="left", padx=5, pady=5)
+
+        self.author_info = ctk.CTkLabel(af, text="", text_color="gray")
+        self.author_info.pack(side="right", padx=10)
+
+        # Stats
+        asf = ctk.CTkFrame(t)
+        asf.grid(row=1, column=0, padx=5, pady=(0, 5), sticky="ew")
+        self.author_stat_labels = {}
+        for i, (key, label, color) in enumerate([
+            ("total_authors", "Authors", "#60a5fa"),
+            ("multi_paper", "2+ papers", "#22c55e"),
+            ("top_q1", "Most Q1 papers", "#f59e0b"),
+            ("top_cited", "Most cited", "#ef4444"),
+        ]):
+            ctk.CTkLabel(asf, text=f"{label}:", font=("Segoe UI", 11)).grid(
+                row=0, column=i*2, padx=(10 if i == 0 else 5, 2), pady=5)
+            lbl = ctk.CTkLabel(asf, text="—", font=("Segoe UI", 12, "bold"), text_color=color)
+            lbl.grid(row=0, column=i*2+1, padx=(0, 10), pady=5)
+            self.author_stat_labels[key] = lbl
+
+        # Treeview
+        a_cols = ("rank", "name", "papers", "q1", "q2", "total_cites", "avg_cites",
+                  "best_q", "score", "h_index", "global_works", "global_cited", "years")
+        self.authors_tree = ttk.Treeview(t, columns=a_cols, show="headings", style="Custom.Treeview")
+        self.authors_tree.heading("rank", text="#")
+        self.authors_tree.heading("name", text="Author")
+        self.authors_tree.heading("papers", text="Papers")
+        self.authors_tree.heading("q1", text="Q1")
+        self.authors_tree.heading("q2", text="Q2")
+        self.authors_tree.heading("total_cites", text="Cites")
+        self.authors_tree.heading("avg_cites", text="Avg")
+        self.authors_tree.heading("best_q", text="Best Q")
+        self.authors_tree.heading("score", text="Score")
+        self.authors_tree.heading("h_index", text="h-index")
+        self.authors_tree.heading("global_works", text="Total Works")
+        self.authors_tree.heading("global_cited", text="Total Cited")
+        self.authors_tree.heading("years", text="Years")
+
+        self.authors_tree.column("rank", width=35, minwidth=30, anchor="center")
+        self.authors_tree.column("name", width=200, minwidth=120)
+        self.authors_tree.column("papers", width=55, minwidth=40, anchor="center")
+        self.authors_tree.column("q1", width=35, minwidth=30, anchor="center")
+        self.authors_tree.column("q2", width=35, minwidth=30, anchor="center")
+        self.authors_tree.column("total_cites", width=60, minwidth=40, anchor="center")
+        self.authors_tree.column("avg_cites", width=50, minwidth=35, anchor="center")
+        self.authors_tree.column("best_q", width=50, minwidth=35, anchor="center")
+        self.authors_tree.column("score", width=50, minwidth=35, anchor="center")
+        self.authors_tree.column("h_index", width=55, minwidth=40, anchor="center")
+        self.authors_tree.column("global_works", width=80, minwidth=50, anchor="center")
+        self.authors_tree.column("global_cited", width=80, minwidth=50, anchor="center")
+        self.authors_tree.column("years", width=80, minwidth=60, anchor="center")
+
+        a_scroll = ttk.Scrollbar(t, orient="vertical", command=self.authors_tree.yview)
+        self.authors_tree.configure(yscrollcommand=a_scroll.set)
+        self.authors_tree.grid(row=2, column=0, padx=(5, 0), pady=5, sticky="nsew")
+        a_scroll.grid(row=2, column=1, pady=5, sticky="ns")
+
+        self.author_data = []
+
+    def _start_analyze(self):
+        if not self.corpus:
+            messagebox.showinfo("Info", "Search for articles first.")
+            return
+        self.status_var.set("Analyzing authors...")
+        self.authors_tree.delete(*self.authors_tree.get_children())
+        threading.Thread(target=self._run_analyze, daemon=True).start()
+
+    def _run_analyze(self):
+        self.author_data = self.engine.analyze_authors(self.corpus)
+
+        self.authors_tree.delete(*self.authors_tree.get_children())
+        for i, a in enumerate(self.author_data, 1):
+            self.authors_tree.insert("", "end", values=(
+                i, a["name"], a["papers"], a["q1_papers"], a["q2_papers"],
+                a["total_cites"], a["avg_cites"], a["best_quartile"],
+                round(a["score"], 1),
+                a.get("h_index") or "—",
+                a.get("works") or "—",
+                a.get("global_cited") or "—",
+                a["year_range"],
+            ))
+
+        multi = sum(1 for a in self.author_data if a["papers"] >= 2)
+        top_q1 = self.author_data[0]["name"] if self.author_data and self.author_data[0]["q1_papers"] > 0 else "—"
+        # Find who has most Q1 papers
+        by_q1 = sorted(self.author_data, key=lambda x: x["q1_papers"], reverse=True)
+        top_q1_name = by_q1[0]["name"] if by_q1 and by_q1[0]["q1_papers"] > 0 else "—"
+        top_cited_name = self.author_data[0]["name"] if self.author_data else "—"
+
+        self.author_stat_labels["total_authors"].configure(text=str(len(self.author_data)))
+        self.author_stat_labels["multi_paper"].configure(text=str(multi))
+        self.author_stat_labels["top_q1"].configure(text=top_q1_name[:25])
+        self.author_stat_labels["top_cited"].configure(text=top_cited_name[:25])
+
+        self.hindex_btn.configure(state="normal")
+        self.author_export_btn.configure(state="normal")
+        self.author_info.configure(
+            text=f"Score = papers*2 + avg_cites + Q1*5 + Q2*2 | h-index columns empty until fetched")
+        self.status_var.set(f"Analyzed {len(self.author_data)} authors")
+        self.tabs.set("Authors")
+
+    def _start_hindex(self):
+        if not self.author_data:
+            return
+        email = self.email_var.get().strip()
+        if not email:
+            messagebox.showerror("Error", "Email required for API.")
+            return
+
+        # Only fetch for top authors (with 2+ papers or top 100)
+        candidates = [a for a in self.author_data if a["papers"] >= 2 and a.get("id")]
+        if len(candidates) > 200:
+            candidates = candidates[:200]
+
+        if not candidates:
+            messagebox.showinfo("Info", "No authors with 2+ papers and OpenAlex ID.")
+            return
+
+        result = messagebox.askyesno(
+            "Fetch h-index",
+            f"This will make {len(candidates)} API calls to get h-index for authors with 2+ papers.\n\n"
+            f"Uses {len(candidates)} of your ~50,000 daily calls.\n\nProceed?")
+        if not result:
+            return
+
+        self.engine.stop_flag = False
+        self._set_running(True)
+        threading.Thread(target=self._run_hindex, args=(candidates, email), daemon=True).start()
+
+    def _run_hindex(self, candidates, email):
+        id_to_details = {}
+        budget_out = False
+
+        for i, author in enumerate(candidates):
+            if self.engine.stop_flag:
+                break
+            aid = author["id"]
+            self.status_var.set(f"Fetching h-index: {i+1}/{len(candidates)} — {author['name'][:30]}")
+            self.progress.set((i + 1) / len(candidates))
+
+            details = self.engine.fetch_author_details(aid, email)
+            if details is None:
+                budget_out = True
+                self.status_var.set("API budget exhausted during h-index fetch")
+                break
+            id_to_details[aid] = details
+
+        # Update author_data
+        for a in self.author_data:
+            d = id_to_details.get(a["id"])
+            if d:
+                a["h_index"] = d["h_index"]
+                a["works"] = d["works"]
+                a["global_cited"] = d["global_cited"]
+
+        # Re-sort by a combined score that includes h-index
+        for a in self.author_data:
+            h = a.get("h_index")
+            h_bonus = h * 3 if isinstance(h, (int, float)) else 0
+            a["score"] = a["papers"] * 2 + a["avg_cites"] + a["q1_papers"] * 5 + a["q2_papers"] * 2 + h_bonus
+
+        self.author_data.sort(key=lambda x: x["score"], reverse=True)
+
+        # Refresh tree
+        self.authors_tree.delete(*self.authors_tree.get_children())
+        for i, a in enumerate(self.author_data, 1):
+            self.authors_tree.insert("", "end", values=(
+                i, a["name"], a["papers"], a["q1_papers"], a["q2_papers"],
+                a["total_cites"], a["avg_cites"], a["best_quartile"],
+                round(a["score"], 1),
+                a.get("h_index") if a.get("h_index") is not None else "—",
+                a.get("works") if a.get("works") is not None else "—",
+                a.get("global_cited") if a.get("global_cited") is not None else "—",
+                a["year_range"],
+            ))
+
+        fetched = sum(1 for a in self.author_data if a.get("h_index") is not None)
+        self.author_info.configure(
+            text=f"h-index fetched for {fetched} authors | Score now includes h-index*3")
+        self.progress.set(1.0)
+        msg = f"h-index done: {fetched} authors"
+        if budget_out:
+            msg += " (budget exhausted, partial)"
+        self.status_var.set(msg)
+        self._set_running(False)
+
+    def _export_authors(self):
+        if not self.author_data:
+            return
+        out_dir = filedialog.askdirectory(title="Select export folder")
+        if not out_dir:
+            return
+        out = Path(out_dir)
+        csv_path = out / "authors_ranking.csv"
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["rank", "name", "openalex_id", "papers_in_corpus", "q1_papers",
+                        "q2_papers", "total_cites", "avg_cites", "best_quartile",
+                        "score", "h_index", "global_works", "global_cited",
+                        "journals_count", "year_range"])
+            for i, a in enumerate(self.author_data, 1):
+                w.writerow([
+                    i, a["name"], a["id"], a["papers"], a["q1_papers"],
+                    a["q2_papers"], a["total_cites"], a["avg_cites"],
+                    a["best_quartile"], round(a["score"], 1),
+                    a.get("h_index", ""), a.get("works", ""),
+                    a.get("global_cited", ""), a["journals_count"], a["year_range"],
+                ])
+        self.status_var.set(f"Authors exported to {csv_path}")
+        messagebox.showinfo("Export", f"Authors ranking saved:\n{csv_path}\n\n{len(self.author_data)} authors")
 
     # ---- Downloads Tab ----
     def _build_downloads_tab(self):
