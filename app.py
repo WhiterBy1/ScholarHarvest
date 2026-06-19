@@ -23,7 +23,7 @@ import requests
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 OPENALEX = "https://api.openalex.org/works"
 OPENALEX_AUTHORS = "https://api.openalex.org/authors"
 
@@ -355,6 +355,28 @@ def setup_treeview_style():
               foreground=[("selected", "white")])
 
 
+def make_sortable(tree):
+    """Make all columns in a Treeview sortable by clicking the header."""
+    def _sort(col, reverse):
+        data = [(tree.set(iid, col), iid) for iid in tree.get_children("")]
+        try:
+            data.sort(key=lambda x: float(x[0]) if x[0].replace(".", "", 1).replace("-", "", 1).isdigit() else float("inf"),
+                      reverse=reverse)
+        except Exception:
+            data.sort(key=lambda x: x[0].lower(), reverse=reverse)
+        for i, (_, iid) in enumerate(data):
+            tree.move(iid, "", i)
+        arrow = " v" if reverse else " ^"
+        for c in tree["columns"]:
+            text = tree.heading(c, "text").rstrip(" ^").rstrip(" v")
+            tree.heading(c, text=text)
+        text = tree.heading(col, "text").rstrip(" ^").rstrip(" v")
+        tree.heading(col, text=text + arrow, command=lambda: _sort(col, not reverse))
+
+    for col in tree["columns"]:
+        tree.heading(col, command=lambda c=col: _sort(c, False))
+
+
 # ============================================================================
 # GUI
 # ============================================================================
@@ -520,6 +542,7 @@ class App(ctk.CTk):
         self.results_tree.configure(yscrollcommand=scroll.set)
         self.results_tree.grid(row=1, column=0, padx=(5, 0), pady=5, sticky="nsew")
         scroll.grid(row=1, column=1, pady=5, sticky="ns")
+        make_sortable(self.results_tree)
 
         # Buttons
         bf = ctk.CTkFrame(t, fg_color="transparent")
@@ -608,6 +631,7 @@ class App(ctk.CTk):
         self.authors_tree.configure(yscrollcommand=a_scroll.set)
         self.authors_tree.grid(row=2, column=0, padx=(5, 0), pady=5, sticky="nsew")
         a_scroll.grid(row=2, column=1, pady=5, sticky="ns")
+        make_sortable(self.authors_tree)
 
         self.author_data = []
 
@@ -825,6 +849,7 @@ class App(ctk.CTk):
         self.dl_tree.configure(yscrollcommand=dl_scroll.set)
         self.dl_tree.grid(row=2, column=0, padx=(5, 0), pady=5, sticky="nsew")
         dl_scroll.grid(row=2, column=1, pady=5, sticky="ns")
+        make_sortable(self.dl_tree)
 
     # ---- Helpers ----
     def _browse_scimago(self):
